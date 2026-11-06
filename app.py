@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse
 from pymysql.cursors import DictCursor
 
 BASE_DIR = Path(os.getenv("IDENT_BRIDGE_DIR", r"C:\ident-bridge"))
-load_dotenv(BASE_DIR / ".env")
+load_dotenv(BASE_DIR / ".env", override=True)
 
 app = FastAPI(title="IDENT <-> Yeastar S20 bridge")
 

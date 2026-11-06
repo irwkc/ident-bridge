@@ -30,6 +30,34 @@ RECORD_PUBLIC_BASE_URL=
 """
 
 
+def _creation_flags() -> int:
+    flags = 0
+    if sys.platform == "win32":
+        # Do NOT use DETACHED_PROCESS — it often breaks windowed PyInstaller children.
+        flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    return flags
+
+
+def _startupinfo():
+    if sys.platform != "win32":
+        return None
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0  # SW_HIDE
+    return si
+
+
+def message_box(text: str, title: str = "IdentBridge") -> None:
+    if sys.platform != "win32":
+        print(f"{title}: {text}")
+        return
+    try:
+        ctypes.windll.user32.MessageBoxW(None, str(text), str(title), 0x40)
+    except Exception:
+        pass
+
+
 def is_admin() -> bool:
     if sys.platform != "win32":
         return os.geteuid() == 0
@@ -40,7 +68,6 @@ def is_admin() -> bool:
 
 
 def elevate_and_rerun(extra_args: list[str] | None = None) -> None:
-    """Re-launch current process with UAC prompt."""
     args = list(extra_args or [])
     if getattr(sys, "frozen", False):
         params = subprocess.list2cmdline(args)
@@ -68,7 +95,6 @@ def ensure_install_layout() -> Path:
         else:
             env.write_text(ENV_TEMPLATE, encoding="utf-8")
 
-    # Keep a copy of app.py next to data for visibility/debug (frozen extracts logic from bundle)
     src_app = project_root() / "app.py"
     dst_app = root / "app.py"
     if src_app.exists() and not getattr(sys, "frozen", False):
@@ -78,23 +104,25 @@ def ensure_install_layout() -> Path:
 
 
 def copy_exe_to_install_dir() -> Path:
-    """Place a stable copy of the exe under C:\\ident-bridge for autostart."""
     root = ensure_install_layout()
     target = root / "IdentBridge.exe"
     current = exe_path()
     if getattr(sys, "frozen", False):
         if current.resolve() != target.resolve():
-            shutil.copy2(current, target)
-        return target
+            try:
+                shutil.copy2(current, target)
+            except OSError:
+                # Running from target already, or file locked — use current
+                return current
+        return target if target.exists() else current
     return current
 
 
 def service_command() -> tuple[str, str]:
-    """Return (executable, arguments) for the keep-alive service."""
     if getattr(sys, "frozen", False):
         exe = str(copy_exe_to_install_dir())
         return exe, "--service"
-    return sys.executable, f'-m manager.main --service'
+    return sys.executable, "-m manager.main --service"
 
 
 def autostart_installed() -> bool:
@@ -104,64 +132,109 @@ def autostart_installed() -> bool:
         ["schtasks", "/Query", "/TN", TASK_NAME],
         capture_output=True,
         text=True,
+        creationflags=_creation_flags(),
     )
     return r.returncode == 0
 
 
+def _register_task_powershell(exe: str, args: str) -> tuple[bool, str]:
+    """Register task with WorkingDirectory via PowerShell (more reliable than schtasks)."""
+    # Escape for PowerShell single-quoted strings
+    def q(s: str) -> str:
+        return s.replace("'", "''")
+
+    root = str(install_dir())
+    ps = f"""
+$ErrorActionPreference = 'Stop'
+$TaskName = '{TASK_NAME}'
+Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+$action = New-ScheduledTaskAction -Execute '{q(exe)}' -Argument '{q(args)}' -WorkingDirectory '{q(root)}'
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 3650) -MultipleInstances IgnoreNew -Hidden
+Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+Start-ScheduledTask -TaskName $TaskName
+'OK'
+"""
+    r = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            ps,
+        ],
+        capture_output=True,
+        text=True,
+        creationflags=_creation_flags(),
+    )
+    out = (r.stdout or "") + (r.stderr or "")
+    return r.returncode == 0 and "OK" in out, out
+
+
 def install_autostart() -> str:
+    from manager.service import append_log
+
     if sys.platform != "win32":
         return "Autostart is only supported on Windows."
     if not is_admin():
         elevate_and_rerun(["--install-autostart"])
         return "Requested administrator rights…"
 
-    ensure_install_layout()
-    exe, args = service_command()
+    try:
+        ensure_install_layout()
+        exe, args = service_command()
+        append_log(f"install: registering task exe={exe} args={args}")
+        ok, out = _register_task_powershell(exe, args)
+        if not ok:
+            # Fallback schtasks ONLOGON as current user
+            user = os.environ.get("USERNAME", "")
+            tr = f'"{exe}" {args}'
+            subprocess.run(
+                ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"],
+                capture_output=True,
+                creationflags=_creation_flags(),
+            )
+            create = subprocess.run(
+                [
+                    "schtasks",
+                    "/Create",
+                    "/TN", TASK_NAME,
+                    "/TR", tr,
+                    "/SC", "ONLOGON",
+                    "/RL", "HIGHEST",
+                    "/RU", user,
+                    "/IT",
+                    "/F",
+                ],
+                capture_output=True,
+                text=True,
+                creationflags=_creation_flags(),
+            )
+            if create.returncode != 0:
+                msg = f"Failed to create task:\n{out}\n{create.stdout}\n{create.stderr}"
+                append_log(msg)
+                message_box(msg)
+                return msg
+            subprocess.run(
+                ["schtasks", "/Run", "/TN", TASK_NAME],
+                capture_output=True,
+                creationflags=_creation_flags(),
+            )
 
-    # Remove old task if present
-    subprocess.run(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"], capture_output=True)
-
-    # /SC ONSTART + highest privileges + run whether user is logged on (SYSTEM)
-    # Use SYSTEM so bridge survives logout.
-    tr = f'"{exe}" {args}'
-    create = subprocess.run(
-        [
-            "schtasks",
-            "/Create",
-            "/TN", TASK_NAME,
-            "/TR", tr,
-            "/SC", "ONSTART",
-            "/RL", "HIGHEST",
-            "/RU", "SYSTEM",
-            "/F",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if create.returncode != 0:
-        # Fallback: current user at logon
-        user = os.environ.get("USERNAME", "")
-        create = subprocess.run(
-            [
-                "schtasks",
-                "/Create",
-                "/TN", TASK_NAME,
-                "/TR", tr,
-                "/SC", "ONLOGON",
-                "/RL", "HIGHEST",
-                "/RU", user,
-                "/F",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if create.returncode != 0:
-            return f"Failed to create task:\n{create.stdout}\n{create.stderr}"
-
-    # Start now
-    subprocess.run(["schtasks", "/Run", "/TN", TASK_NAME], capture_output=True)
-    time.sleep(1)
-    return "Autostart installed. Service started."
+        # Also ensure a live process right now
+        time.sleep(1.5)
+        start_service_process()
+        msg = "Autostart installed. Service started."
+        append_log(msg)
+        message_box(msg)
+        return msg
+    except Exception as exc:
+        msg = f"Install failed: {exc}"
+        append_log(msg)
+        message_box(msg)
+        return msg
 
 
 def uninstall_autostart() -> str:
@@ -170,65 +243,121 @@ def uninstall_autostart() -> str:
     if not is_admin():
         elevate_and_rerun(["--uninstall-autostart"])
         return "Requested administrator rights…"
-    subprocess.run(["schtasks", "/End", "/TN", TASK_NAME], capture_output=True)
+    subprocess.run(
+        ["schtasks", "/End", "/TN", TASK_NAME],
+        capture_output=True,
+        creationflags=_creation_flags(),
+    )
     r = subprocess.run(
         ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"],
         capture_output=True,
         text=True,
+        creationflags=_creation_flags(),
     )
     if r.returncode != 0:
-        return f"Remove failed:\n{r.stdout}\n{r.stderr}"
+        msg = f"Remove failed:\n{r.stdout}\n{r.stderr}"
+        message_box(msg)
+        return msg
+    message_box("Autostart removed.")
     return "Autostart removed."
 
 
 def start_service_process() -> str:
-    """Launch headless service process if not already up."""
-    from manager.service import is_bridge_up, read_service_pid
+    from manager.service import append_log, is_bridge_up, read_service_pid
 
-    if is_bridge_up() or read_service_pid():
+    if is_bridge_up():
         return "Already running."
+    if read_service_pid():
+        return "Already starting…"
 
     ensure_install_layout()
-    if getattr(sys, "frozen", False):
-        exe = str(copy_exe_to_install_dir())
-        subprocess.Popen(
-            [exe, "--service"],
-            cwd=str(install_dir()),
-            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            close_fds=True,
-        )
-    else:
-        subprocess.Popen(
-            [sys.executable, "-m", "manager.main", "--service"],
-            cwd=str(project_root()),
-            start_new_session=True,
-        )
-    return "Starting…"
+    append_log("install: launching --service process")
+
+    try:
+        if getattr(sys, "frozen", False):
+            exe = str(copy_exe_to_install_dir())
+            subprocess.Popen(
+                [exe, "--service"],
+                cwd=str(install_dir()),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                startupinfo=_startupinfo(),
+                creationflags=_creation_flags(),
+                close_fds=True,
+            )
+        else:
+            subprocess.Popen(
+                [sys.executable, "-m", "manager.main", "--service"],
+                cwd=str(project_root()),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+    except Exception as exc:
+        append_log(f"install: start failed {exc!r}")
+        return f"Start failed: {exc}"
+
+    # Wait briefly for health
+    for _ in range(20):
+        time.sleep(0.5)
+        if is_bridge_up():
+            return "Started. API :8000 OK"
+        if read_service_pid() is None and _ > 4:
+            break
+
+    # Still not up — point to log
+    return "Started process, waiting for API… Check Open log if it stays STOPPED."
 
 
 def stop_service_process() -> str:
-    from manager.service import read_service_pid
+    from manager.service import append_log, pids_listening_on_port, read_service_pid
 
-    # End scheduled task instance if any
+    append_log("install: stop requested")
     if sys.platform == "win32":
-        subprocess.run(["schtasks", "/End", "/TN", TASK_NAME], capture_output=True)
+        subprocess.run(
+            ["schtasks", "/End", "/TN", TASK_NAME],
+            capture_output=True,
+            creationflags=_creation_flags(),
+        )
 
+    killed: list[int] = []
     pid = read_service_pid()
     if pid:
+        killed.append(pid)
+
+    for p in pids_listening_on_port(8000):
+        if p not in killed:
+            killed.append(p)
+
+    for p in killed:
         if sys.platform == "win32":
-            subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"], capture_output=True)
+            subprocess.run(
+                ["taskkill", "/PID", str(p), "/F", "/T"],
+                capture_output=True,
+                creationflags=_creation_flags(),
+            )
         else:
             try:
-                os.kill(pid, 15)
+                os.kill(p, 15)
             except OSError:
                 pass
-        return f"Stopped PID {pid}."
+
+    # Clear stale lock
+    lock = install_dir() / "service.lock"
+    try:
+        lock.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    if killed:
+        return f"Stopped PID(s): {', '.join(map(str, killed))}"
     return "Service was not running."
 
 
 def restart_service_process() -> str:
-    stop_service_process()
+    stop_msg = stop_service_process()
     time.sleep(1.5)
-    return start_service_process()
+    start_msg = start_service_process()
+    return f"{stop_msg} → {start_msg}"

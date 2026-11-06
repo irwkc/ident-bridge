@@ -1,13 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
-hidden = []
-hidden += collect_submodules("uvicorn")
-hidden += collect_submodules("fastapi")
-hidden += collect_submodules("starlette")
-hidden += collect_submodules("anyio")
-hidden += collect_submodules("pymysql")
-hidden += [
+datas = [(".env.example", ".")]
+binaries = []
+hidden = [
     "app",
     "manager",
     "manager.main",
@@ -17,13 +13,32 @@ hidden += [
     "manager.paths",
     "dotenv",
     "tzdata",
+    "uvicorn.logging",
+    "uvicorn.loops",
+    "uvicorn.loops.auto",
+    "uvicorn.protocols",
+    "uvicorn.protocols.http",
+    "uvicorn.protocols.http.auto",
+    "uvicorn.protocols.websockets",
+    "uvicorn.protocols.websockets.auto",
+    "uvicorn.lifespan",
+    "uvicorn.lifespan.on",
 ]
+
+for pkg in ("uvicorn", "fastapi", "starlette", "anyio", "pymysql", "pydantic", "pydantic_core"):
+    try:
+        d, b, h = collect_all(pkg)
+        datas += d
+        binaries += b
+        hidden += h
+    except Exception:
+        hidden += collect_submodules(pkg)
 
 a = Analysis(
     ["manager/main.py"],
     pathex=["."],
-    binaries=[],
-    datas=[(".env.example", ".")],
+    binaries=binaries,
+    datas=datas,
     hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},
@@ -43,10 +58,10 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,  # GUI app; --service still works without console
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

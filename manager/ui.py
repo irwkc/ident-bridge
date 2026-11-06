@@ -158,14 +158,26 @@ class ManagerApp(tk.Tk):
             start_service_process()
 
     def on_start(self) -> None:
+        self.detail_var.set("Starting…")
+        self.update_idletasks()
         msg = start_service_process()
         self.detail_var.set(msg)
+        if "failed" in msg.lower() or "STOPPED" in msg or "Check Open log" in msg:
+            # Show last log lines to help diagnose
+            try:
+                lines = log_path().read_text(encoding="utf-8", errors="replace").splitlines()[-12:]
+                if lines:
+                    messagebox.showwarning("IdentBridge", "Service did not become healthy yet.\n\n" + "\n".join(lines))
+            except OSError:
+                pass
 
     def on_stop(self) -> None:
         msg = stop_service_process()
         self.detail_var.set(msg)
 
     def on_restart(self) -> None:
+        self.detail_var.set("Restarting…")
+        self.update_idletasks()
         msg = restart_service_process()
         self.detail_var.set(msg)
 
