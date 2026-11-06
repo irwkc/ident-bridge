@@ -1,0 +1,26 @@
+# secrets & local data
+.env
+.env.*
+!.env.example
+bridge.log
+service.lock
+*.log
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+*.spec.bak
+
+# os / ide
+.DS_Store
+.idea/
+.vscode/
+
+# old helper scripts (optional local)
+SETUP_AUTOSTART.cmd
+SETUP_AUTOSTART.ps1
