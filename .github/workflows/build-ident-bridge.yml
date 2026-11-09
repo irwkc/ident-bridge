@@ -1,12 +1,15 @@
-name: Build Windows EXE
+name: Build IdentBridge EXE
 
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - "release/**"
-      - "**.md"
+    paths:
+      - "ident-bridge/**"
+      - ".github/workflows/build-ident-bridge.yml"
   pull_request:
+    paths:
+      - "ident-bridge/**"
+      - ".github/workflows/build-ident-bridge.yml"
   workflow_dispatch:
 
 permissions:
@@ -15,11 +18,12 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ident-bridge
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -38,12 +42,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: IdentBridge-windows
-          path: dist/IdentBridge.exe
+          path: ident-bridge/dist/IdentBridge.exe
           if-no-files-found: error
 
       - name: Publish EXE into repo (release/)
         if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         shell: bash
+        working-directory: ident-bridge
         run: |
           mkdir -p release
           cp -f dist/IdentBridge.exe release/IdentBridge.exe
@@ -61,7 +66,7 @@ jobs:
         if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
+          tag_name: ident-bridge-build-${{ github.run_number }}
           name: IdentBridge Windows build ${{ github.run_number }}
-          files: dist/IdentBridge.exe
+          files: ident-bridge/dist/IdentBridge.exe
           generate_release_notes: true

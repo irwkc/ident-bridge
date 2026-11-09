@@ -1,0 +1,2 @@
+# Runtime: Python 3.10+ standard library (tkinter).
+# Build EXE on Windows: pip install -r requirements-build.txt

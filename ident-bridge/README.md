@@ -1,0 +1,53 @@
+# IdentBridge
+
+Windows-приложение для моста **IDENT ↔ Yeastar S20**.
+
+Один файл `IdentBridge.exe`:
+
+- ставит рабочую папку `C:\ident-bridge`
+- поднимает API (uvicorn) на порту **8000**
+- keep-alive: при падении перезапускает сам
+- автозапуск при старте Windows (Планировщик, UAC)
+- небольшое окно: статус / Start / Stop / Restart / лог / `.env`
+
+## Скачать EXE
+
+- [IdentBridge.exe](https://github.com/irwkc/ident-bridge/raw/main/ident-bridge/release/IdentBridge.exe)
+- [Releases](https://github.com/irwkc/ident-bridge/releases) · [Actions](https://github.com/irwkc/ident-bridge/actions/workflows/build-ident-bridge.yml)
+
+## Установка на ПК клиники
+
+1. Скачай `IdentBridge.exe`
+2. Запусти (Windows спросит права при установке автозапуска)
+3. Нажми **Install autostart** → **Да** в UAC
+4. Открой **Edit .env** и заполни ключи (как в старом `.env`)
+5. Для прослушивания записей в Ident проверь:
+   - `RECORDINGS_ROOT` — UNC к `...\mmc1\autorecords` на Yeastar  
+   - `RECORD_PUBLIC_BASE_URL` — `http://<IP этого ПК>:8000`  
+   (можно оставить пустыми: подставятся автоматом)
+6. **Restart** → **Install autostart** от имени пользователя, у которого есть доступ к шаре Yeastar (не SYSTEM)
+
+Готово: bridge работает в фоне, окно можно закрыть.
+
+## Локальная разработка
+
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python -m manager.main
+```
+
+Headless-сервис:
+
+```bash
+python -m manager.main --service
+```
+
+## Сборка EXE локально (Windows)
+
+```bash
+pip install -r requirements-build.txt
+pyinstaller --noconfirm IdentBridge.spec
+# → dist\IdentBridge.exe
+```

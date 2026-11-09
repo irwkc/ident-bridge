@@ -18,6 +18,8 @@ build/
 # готовый EXE кладём в release/ (см. GitHub Actions)
 !release/
 !release/IdentBridge.exe
+!**/release/
+!**/release/*.exe
 
 
 # os / ide
@@ -28,3 +30,8 @@ build/
 # old helper scripts (optional local)
 SETUP_AUTOSTART.cmd
 SETUP_AUTOSTART.ps1
+
+# ct-share local
+ct-share/local-data/
+ct-share/dist/
+ct-share/build/
