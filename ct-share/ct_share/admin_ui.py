@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import shutil
 import threading
+import zipfile
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from ct_share.common import (
+    describe_drives,
     find_patient_source_on_disc,
-    iter_ready_discs,
+    iter_ready_media,
+    media_fingerprint,
     parse_patient_folder,
     shared_root,
 )
@@ -32,13 +35,13 @@ class AdminApp:
 
         self.cfg = load_config()
         self.poll_seconds = float(self.cfg.get("poll_seconds", 2))
-        self._seen: set[str] = set()
+        self._handled: set[str] = set()
         self._busy = False
         self._stop = threading.Event()
 
         self.root = tk.Tk()
         self.root.title("CT Share — Админ")
-        self.root.geometry("400x200")
+        self.root.geometry("420x230")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
         self._build()
@@ -51,14 +54,14 @@ class AdminApp:
         frame = ttk.Frame(self.root, padding=16)
         frame.pack(fill="both", expand=True)
 
-        ttk.Label(frame, text="Ожидание диска с КТ…", font=("", 11)).pack(anchor="w")
-        self.status = ttk.Label(frame, text="Мониторинг дисковода", foreground="#444")
+        ttk.Label(frame, text="Ожидание диска / флешки с КТ…", font=("", 11)).pack(anchor="w")
+        self.status = ttk.Label(frame, text="Мониторинг…", foreground="#444", wraplength=380)
         self.status.pack(anchor="w", pady=(8, 0))
 
         self.share_lbl = ttk.Label(
             frame,
             text=f"Общая папка:\n{self.cfg.get('shared_folder', '')}",
-            wraplength=360,
+            wraplength=380,
             foreground="#666",
             font=("", 9),
         )
@@ -66,7 +69,8 @@ class AdminApp:
 
         btns = ttk.Frame(frame)
         btns.pack(fill="x", pady=(14, 0))
-        ttk.Button(btns, text="Настройки", command=self._settings).pack(side="left")
+        ttk.Button(btns, text="Выбрать папку…", command=self._pick_folder).pack(side="left")
+        ttk.Button(btns, text="Настройки", command=self._settings).pack(side="left", padx=(8, 0))
         self.auto_btn = ttk.Button(btns, text=self._autostart_label(), command=self._toggle_autostart)
         self.auto_btn.pack(side="left", padx=(8, 0))
 
@@ -85,6 +89,23 @@ class AdminApp:
         else:
             install_admin_autostart()
         self.auto_btn.configure(text=self._autostart_label())
+
+    def _pick_folder(self) -> None:
+        chosen = filedialog.askdirectory(parent=self.root, title="Папка или диск с КТ")
+        if not chosen:
+            return
+        root = Path(chosen)
+        found = find_patient_source_on_disc(root)
+        if not found:
+            # Если выбрали саму папку пациента
+            if root.is_dir():
+                found = (root.name, root)
+            else:
+                messagebox.showwarning("КТ", "Не удалось распознать снимок в этой папке.", parent=self.root)
+                return
+        folder_name, source = found
+        self._busy = True
+        self._ask_and_copy(folder_name, source)
 
     def _on_close(self) -> None:
         self._stop.set()
@@ -108,30 +129,33 @@ class AdminApp:
         if self._busy:
             return
 
-        ready = {str(p) for p in iter_ready_discs()}
-        self._seen &= ready
-
-        for root in iter_ready_discs():
-            key = str(root)
-            if key in self._seen:
+        ready_fps: set[str] = set()
+        for root in iter_ready_media():
+            fp = media_fingerprint(root)
+            ready_fps.add(fp)
+            if fp in self._handled:
                 continue
 
             found = find_patient_source_on_disc(root)
             if not found:
-                self._seen.add(key)
-                self._set_status(f"{root} — не похоже на КТ")
+                # Не КТ — не помечаем навсегда: при смене содержимого спросим снова
+                self._set_status(f"{root} — нет КТ. {describe_drives()}")
                 continue
 
             folder_name, source = found
-            self._seen.add(key)
+            self._handled.add(fp)
             self._busy = True
+            append_log("admin", f"detected {folder_name} on {root}")
             self.root.after(0, lambda fn=folder_name, src=source: self._ask_and_copy(fn, src))
             return
 
-        if not ready:
-            self._set_status("Дисковод пуст")
+        # Носитель извлечён — снова спросим при следующей вставке
+        self._handled &= ready_fps
+
+        if not ready_fps:
+            self._set_status(f"Носитель не вставлен. {describe_drives()}")
         else:
-            self._set_status("Диск проверен")
+            self._set_status(f"Готово. {describe_drives()}")
 
     def _ask_and_copy(self, folder_name: str, source: Path) -> None:
         fio, birth = parse_patient_folder(folder_name)
@@ -144,6 +168,8 @@ class AdminApp:
             return
 
         dest = share / folder_name
+        self.root.lift()
+        self.root.attributes("-topmost", True)
         answer = messagebox.askyesno(
             "Поделиться КТ?",
             f"Найден снимок:\n\n{label}\n\nПапка:\n{folder_name}\n\n"
@@ -187,17 +213,7 @@ class AdminApp:
         def worker() -> None:
             err: Exception | None = None
             try:
-                is_drive_root = len(source.parts) == 1 or str(source).endswith(":\\")
-                if is_drive_root:
-                    dest.mkdir(parents=True, exist_ok=True)
-                    for child in source.iterdir():
-                        target = dest / child.name
-                        if child.is_dir():
-                            shutil.copytree(child, target)
-                        else:
-                            shutil.copy2(child, target)
-                else:
-                    shutil.copytree(source, dest)
+                _copy_scan(source, dest)
             except Exception as exc:  # noqa: BLE001
                 err = exc
 
@@ -221,6 +237,27 @@ class AdminApp:
         if not getattr(self, "_ready", False):
             return
         self.root.mainloop()
+
+
+def _copy_scan(source: Path, dest: Path) -> None:
+    if source.is_file() and source.suffix.lower() == ".zip":
+        dest.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(source, "r") as zf:
+            zf.extractall(dest)
+        return
+
+    is_drive_root = len(source.parts) == 1 or str(source).endswith(":\\")
+    if is_drive_root:
+        dest.mkdir(parents=True, exist_ok=True)
+        for child in source.iterdir():
+            target = dest / child.name
+            if child.is_dir():
+                shutil.copytree(child, target)
+            else:
+                shutil.copy2(child, target)
+        return
+
+    shutil.copytree(source, dest)
 
 
 def run_gui() -> None:

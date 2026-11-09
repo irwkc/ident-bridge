@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ct_share.paths import config_path, exe_path, install_dir, log_path, project_root, resource_path
+from ct_share.paths import config_path, exe_path, install_dir, log_path, resource_path
 
 DEFAULT_CONFIG = {
     "shared_folder": r"\\SERVER\KT",
@@ -19,8 +19,10 @@ DEFAULT_CONFIG = {
 ADMIN_EXE_NAME = "CTShareAdmin.exe"
 DOCTOR_EXE_NAME = "CTShareDoctor.exe"
 ADMIN_TASK = "CTShareAdmin"
+ADMIN_RUN_VALUE = "CTShareAdmin"
 ADMIN_SHORTCUT = "CT Share Админ.lnk"
 DOCTOR_SHORTCUT = "CT Share Врач.lnk"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
 def _creation_flags() -> int:
@@ -182,26 +184,27 @@ def install_shortcuts(role: str) -> None:
     create_shortcut(_start_menu_dir() / name, target, "", desc)
 
 
-def elevate_and_rerun(extra_args: list[str], exe_name: str) -> None:
+def _admin_launch_command() -> str:
+    """Команда автозапуска для текущего пользователя (без UAC)."""
     if getattr(sys, "frozen", False):
-        params = subprocess.list2cmdline(extra_args)
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", str(exe_path()), params, str(install_dir()), 1
-        )
-    else:
-        module = "ct_share.admin_main" if "Admin" in exe_name or "admin" in " ".join(extra_args) else "ct_share.doctor_main"
-        if "--install-autostart" in extra_args or "--uninstall-autostart" in extra_args:
-            module = "ct_share.admin_main"
-        cmd = [sys.executable, "-m", module, *extra_args]
-        params = subprocess.list2cmdline(cmd[1:])
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", cmd[0], params, str(project_root()), 1
-        )
+        exe = copy_exe_to_install_dir(ADMIN_EXE_NAME)
+        return f'"{exe}"'
+    py = sys.executable
+    return f'"{py}" -m ct_share.admin_main'
 
 
 def autostart_installed() -> bool:
     if sys.platform != "win32":
         return False
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            winreg.QueryValueEx(key, ADMIN_RUN_VALUE)
+            return True
+    except OSError:
+        pass
+    # Старый способ через Планировщик
     r = subprocess.run(
         ["schtasks", "/Query", "/TN", ADMIN_TASK],
         capture_output=True,
@@ -214,25 +217,27 @@ def autostart_installed() -> bool:
 def install_admin_autostart() -> str:
     if sys.platform != "win32":
         return "Автозапуск только на Windows."
-    if not is_admin():
-        elevate_and_rerun(["--install-autostart"], ADMIN_EXE_NAME)
-        return "Запрос прав администратора…"
-
     ensure_install_layout()
-    if getattr(sys, "frozen", False):
-        exe = str(copy_exe_to_install_dir(ADMIN_EXE_NAME))
-    else:
-        exe = sys.executable
-        # For scheduled task in dev: pythonw -m ct_share.admin_main
-        args = f'-m ct_share.admin_main'
-        ok, out = _register_task(exe, args)
-        msg = "Автозапуск установлен." if ok else f"Не удалось:\n{out}"
-        message_box(msg, "CT Share Админ")
+    cmd = _admin_launch_command()
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, ADMIN_RUN_VALUE, 0, winreg.REG_SZ, cmd)
+    except OSError as exc:
+        msg = f"Не удалось включить автозапуск:\n{exc}"
+        append_log("admin", msg)
+        message_box(msg, "CT Share Админ", "error")
         return msg
 
-    ok, out = _register_task(exe, "")
-    msg = "Автозапуск установлен. Админ-приложение стартует при входе в Windows." if ok else f"Не удалось:\n{out}"
-    append_log("admin", msg)
+    # Убрать старую задачу Планировщика, если была
+    subprocess.run(
+        ["schtasks", "/Delete", "/TN", ADMIN_TASK, "/F"],
+        capture_output=True,
+        creationflags=_creation_flags(),
+    )
+    msg = "Автозапуск включён. Приложение откроется при входе в Windows."
+    append_log("admin", msg + f" cmd={cmd}")
     message_box(msg, "CT Share Админ")
     return msg
 
@@ -240,53 +245,25 @@ def install_admin_autostart() -> str:
 def uninstall_admin_autostart() -> str:
     if sys.platform != "win32":
         return "Windows only."
-    if not is_admin():
-        elevate_and_rerun(["--uninstall-autostart"], ADMIN_EXE_NAME)
-        return "Запрос прав администратора…"
-    subprocess.run(
-        ["schtasks", "/End", "/TN", ADMIN_TASK],
-        capture_output=True,
-        creationflags=_creation_flags(),
-    )
-    r = subprocess.run(
-        ["schtasks", "/Delete", "/TN", ADMIN_TASK, "/F"],
-        capture_output=True,
-        text=True,
-        creationflags=_creation_flags(),
-    )
-    if r.returncode != 0:
-        msg = f"Не удалось удалить:\n{r.stdout}\n{r.stderr}"
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            try:
+                winreg.DeleteValue(key, ADMIN_RUN_VALUE)
+            except FileNotFoundError:
+                pass
+    except OSError as exc:
+        msg = f"Не удалось выключить автозапуск:\n{exc}"
         message_box(msg, "CT Share Админ", "error")
         return msg
-    message_box("Автозапуск удалён.", "CT Share Админ")
-    return "Автозапуск удалён."
-
-
-def _register_task(exe: str, args: str) -> tuple[bool, str]:
-    def q(s: str) -> str:
-        return s.replace("'", "''")
-
-    root = str(install_dir())
-    ps = f"""
-$ErrorActionPreference = 'Stop'
-$TaskName = '{ADMIN_TASK}'
-$userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
-$action = New-ScheduledTaskAction -Execute '{q(exe)}' -Argument '{q(args)}' -WorkingDirectory '{q(root)}'
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
-$principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 3650) -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-'OK'
-"""
-    r = subprocess.run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+    subprocess.run(
+        ["schtasks", "/Delete", "/TN", ADMIN_TASK, "/F"],
         capture_output=True,
-        text=True,
         creationflags=_creation_flags(),
     )
-    out = (r.stdout or "") + (r.stderr or "")
-    return r.returncode == 0 and "OK" in out, out
+    message_box("Автозапуск выключен.", "CT Share Админ")
+    return "Автозапуск выключен."
 
 
 def first_run_install(role: str) -> None:
