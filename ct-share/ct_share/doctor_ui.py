@@ -4,9 +4,10 @@ import os
 import subprocess
 import sys
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox, ttk
 
-from ct_share.common import recent_scans, search_scans, shared_root
+from ct_share.common import find_viewer_exe, recent_scans, search_scans, shared_root
 from ct_share.install import first_run_install, load_config
 from ct_share.setup_dialog import run_setup_if_needed, show_setup_dialog
 
@@ -72,7 +73,8 @@ class DoctorApp:
 
         btns = ttk.Frame(frame)
         btns.pack(fill="x")
-        ttk.Button(btns, text="Открыть", command=self.open_selected).pack(side="left")
+        ttk.Button(btns, text="Открыть снимок", command=self.open_selected).pack(side="left")
+        ttk.Button(btns, text="Папка", command=self.open_folder).pack(side="left", padx=(8, 0))
         ttk.Button(btns, text="Обновить", command=self.refresh).pack(side="left", padx=(8, 0))
 
         self.share_lbl = ttk.Label(
@@ -111,24 +113,43 @@ class DoctorApp:
         if self._items:
             self.listbox.selection_set(0)
 
-    def open_selected(self) -> None:
+    def _selected_path(self) -> Path | None:
         sel = self.listbox.curselection()
         if not sel:
-            return
-        scan = self._items[sel[0]]
-        path = scan.path
+            return None
+        path = self._items[sel[0]].path
         if not path.exists():
             messagebox.showerror("Ошибка", f"Папка не найдена:\n{path}", parent=self.root)
+            return None
+        return path
+
+    def open_selected(self) -> None:
+        path = self._selected_path()
+        if not path:
             return
+        exe = find_viewer_exe(path)
+        target = exe if exe else path
         try:
-            if sys.platform.startswith("win"):
-                os.startfile(path)  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                subprocess.run(["open", str(path)], check=False)
-            else:
-                subprocess.run(["xdg-open", str(path)], check=False)
+            self._launch(target)
         except OSError as exc:
             messagebox.showerror("Ошибка", str(exc), parent=self.root)
+
+    def open_folder(self) -> None:
+        path = self._selected_path()
+        if not path:
+            return
+        try:
+            self._launch(path)
+        except OSError as exc:
+            messagebox.showerror("Ошибка", str(exc), parent=self.root)
+
+    def _launch(self, target: Path) -> None:
+        if sys.platform.startswith("win"):
+            os.startfile(str(target))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(target)], check=False)
+        else:
+            subprocess.run(["xdg-open", str(target)], check=False)
 
     def run(self) -> None:
         if not getattr(self, "_ready", False):

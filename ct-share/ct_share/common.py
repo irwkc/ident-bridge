@@ -38,6 +38,26 @@ TECHNICAL_NAMES = {
     "system",
     "meta",
     "metadata",
+    "dotnet20",
+    "setup",
+    "vcredist",
+    "vcredist_x86",
+    "vcredist_x64",
+}
+
+# GUID / хеш-имена вроде bded778e759c4a05...
+HEX_NAME_RE = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
+VOLUME_TECH_RE = re.compile(r"^(GWG|CD|DVD|VOLUME|DISK|DISC)\d", re.IGNORECASE)
+
+SKIP_EXE_NAMES = {
+    "setup",
+    "install",
+    "uninstall",
+    "vcredist",
+    "dotnet",
+    "dotnetfx",
+    "msiexec",
+    "redist",
 }
 
 DRIVE_REMOVABLE = 2
@@ -130,27 +150,57 @@ def display_label(folder_name: str) -> str:
     return f"{fio} ({birth})" if birth else fio
 
 
+def is_garbage_name(text: str) -> bool:
+    """Хеши, GUID, технические метки диска — не ФИО."""
+    stem = _strip_junk(text)
+    if not stem:
+        return True
+    compact = re.sub(r"[\-_]", "", stem)
+    if HEX_NAME_RE.fullmatch(compact):
+        return True
+    if VOLUME_TECH_RE.match(stem):
+        return True
+    if stem.lower() in TECHNICAL_NAMES:
+        return True
+    # одно «слово» из латиницы+цифр без кириллицы и без пробелов/подчёркиваний как ФИО
+    if len(stem) >= 16 and re.fullmatch(r"[0-9A-Za-z\-_]+", stem) and not re.search(r"[А-Яа-яЁё]", stem):
+        if not re.search(r"[_\s]", text) or HEX_NAME_RE.fullmatch(compact):
+            return True
+    return False
+
+
 def extract_identity_from_text(text: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Из произвольной строки → (fio_folder, display, birth_date).
     """
     stem = _strip_junk(text)
-    if not stem or stem.lower() in TECHNICAL_NAMES:
+    if not stem or stem.lower() in TECHNICAL_NAMES or is_garbage_name(stem):
         return None, None, None
 
     m = NAME_WITH_DATE_RE.match(stem)
     if m:
         parts = _normalize_fio_parts(m.group("name"))
-        if len(parts) >= 2:
+        if len(parts) >= 2 and not is_garbage_name("_".join(parts)):
             birth = f"{m.group('year')}-{m.group('month')}-{m.group('day')}"
             return fio_to_folder(parts), fio_to_display(parts), birth
 
     parts = _normalize_fio_parts(stem)
-    # Фамилия + Имя (+ Отчество) — минимум 2 слова
+    # Фамилия + Имя (+ Отчество) — минимум 2 слова с буквами
     if len(parts) >= 2 and all(re.search(r"[A-Za-zА-Яа-яЁё]", p) for p in parts[:3]):
-        return fio_to_folder(parts), fio_to_display(parts), None
+        folder = fio_to_folder(parts)
+        if folder and not is_garbage_name(folder):
+            return folder, fio_to_display(parts), None
 
     return None, None, None
+
+
+def human_fio_to_folder(text: str) -> str:
+    """Ручной ввод админа → безопасное имя папки."""
+    parts = _normalize_fio_parts(text)
+    if parts:
+        return fio_to_folder(parts)
+    safe = re.sub(r"[^\wА-Яа-яЁё\-]+", "_", text.strip(), flags=re.UNICODE).strip("_")
+    return safe or f"КТ_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 
 def looks_like_patient_name(name: str) -> bool:
@@ -324,7 +374,28 @@ def identity_from_dicom_tree(root: Path) -> tuple[Optional[str], Optional[str], 
     return None, None, None
 
 
-def shallow_has_ct(path: Path, max_depth: int = 3) -> bool:
+def looks_like_viewer_disc(root: Path) -> bool:
+    """Диск с просмотрщиком: Autorun.inf, Setup, VCRedist, .exe и т.п."""
+    try:
+        names = {p.name.lower() for p in root.iterdir()}
+    except OSError:
+        return False
+    if "autorun.inf" in names:
+        return True
+    markers = {"setup", "dotnet20", "vcredist_x86", "vcredist_x64", "nntviewer"}
+    if names & markers:
+        return True
+    try:
+        if any(p.is_file() and p.suffix.lower() == ".exe" for p in root.iterdir()):
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def shallow_has_ct(path: Path, max_depth: int = 4) -> bool:
+    if looks_like_viewer_disc(path):
+        return True
     try:
         base_depth = len(path.parts)
         for child in path.rglob("*"):
@@ -334,7 +405,7 @@ def shallow_has_ct(path: Path, max_depth: int = 3) -> bool:
             name = child.name.lower()
             if name.endswith(".dcm") or name in {"dicomdir", "dicom"}:
                 return True
-            if "nntviewer" in name or "viewer" in name:
+            if "nntviewer" in name or name.endswith(".exe"):
                 return True
             if name.endswith(".zip") and looks_like_patient_name(child.name):
                 return True
@@ -358,83 +429,199 @@ def _identity_from_path_name(path: Path) -> tuple[Optional[str], Optional[str], 
 
 def detect_scan(disc_root: Path) -> Optional[DetectedScan]:
     """
-    Умно ищет снимок и ФИО:
-    1) имя папки/ZIP на диске
-    2) DICOM PatientName внутри файлов
-    3) метка тома
-    Папка на шаре = только чистое ФИО.
+    Всегда копируем ВЕСЬ диск/носитель.
+    ФИО — подсказка (может быть пустой/технической); админ подтверждает вручную.
     """
     try:
         entries = [p for p in disc_root.iterdir() if not p.name.startswith(".")]
     except OSError:
         return None
 
-    # --- кандидаты источника ---
     patient_dirs = [p for p in entries if p.is_dir() and looks_like_patient_name(p.name)]
     patient_zips = [
         p
         for p in entries
         if p.is_file() and p.suffix.lower() == ".zip" and looks_like_patient_name(p.name)
     ]
-    ct_dirs = [p for p in entries if p.is_dir() and looks_like_ct_folder(p.name)]
-    has_ct = bool(patient_dirs or patient_zips or ct_dirs or shallow_has_ct(disc_root))
+    has_ct = bool(
+        patient_dirs
+        or patient_zips
+        or looks_like_viewer_disc(disc_root)
+        or shallow_has_ct(disc_root)
+    )
     if not has_ct:
         return None
 
-    source: Path
-    if patient_dirs:
-        source = patient_dirs[0]
-    elif patient_zips:
-        source = patient_zips[0]
-    elif ct_dirs and len(ct_dirs) == 1 and not looks_like_patient_name(ct_dirs[0].name):
-        # один DICOM/NNTViewer — копируем весь диск
-        source = disc_root
-    elif ct_dirs:
-        source = disc_root
-    else:
-        source = disc_root
+    # Всегда весь носитель — на диске Setup, DotNet, exe и данные вместе
+    source = disc_root
 
-    # --- ФИО: приоритет имя → DICOM → метка тома ---
     fio_folder = display = birth = None
-
-    for candidate in (
-        source if source != disc_root else None,
-        *(patient_dirs[:1]),
-        *(patient_zips[:1]),
-        *entries,
-    ):
-        if candidate is None:
-            continue
+    for candidate in (*patient_dirs[:1], *patient_zips[:1], *entries):
         fio_folder, display, birth = _identity_from_path_name(candidate)
         if fio_folder:
             break
 
     if not fio_folder:
-        scan_root = source if source.is_dir() else disc_root
-        fio_folder, display, birth = identity_from_dicom_tree(scan_root)
+        fio_folder, display, birth = identity_from_dicom_tree(disc_root)
 
     if not fio_folder:
         label = volume_label(disc_root)
-        if label:
+        if label and not is_garbage_name(label):
             fio_folder, display, birth = extract_identity_from_text(label)
 
-    if not fio_folder:
-        # последний шанс — техническое имя с датой
-        fio_folder = f"КТ_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        display = fio_folder.replace("_", " ")
+    if fio_folder and is_garbage_name(fio_folder):
+        fio_folder = display = None
 
-    # если имя взяли из папки вида ФИО_дата_..., birth уже есть;
-    # если нет — попробуем добрать дату из DICOM
-    if birth is None and source.is_dir():
-        _, _, birth2 = identity_from_dicom_tree(source if source.is_dir() else disc_root)
-        birth = birth2
+    if birth is None:
+        _, _, birth = identity_from_dicom_tree(disc_root)
 
     return DetectedScan(
-        fio_folder=fio_folder,
-        display_name=display or fio_folder.replace("_", " "),
+        fio_folder=fio_folder or "",
+        display_name=display or "",
         birth_date=birth,
         source=source,
     )
+
+
+def parse_autorun_exe(root: Path) -> Optional[Path]:
+    inf = root / "Autorun.inf"
+    if not inf.exists():
+        inf = root / "autorun.inf"
+    if not inf.exists():
+        return None
+    try:
+        text = inf.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        try:
+            text = inf.read_text(encoding="cp1251", errors="ignore")
+        except OSError:
+            return None
+    for line in text.splitlines():
+        line = line.strip()
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        if key.strip().lower() in {"open", "shellexecute"}:
+            rel = val.strip().strip('"')
+            if not rel:
+                continue
+            cand = root / rel
+            if cand.exists() and cand.suffix.lower() == ".exe":
+                return cand
+    return None
+
+
+def find_viewer_exe(folder: Path) -> Optional[Path]:
+    """Ищет .exe просмотрщика КТ в скопированной папке."""
+    if not folder.exists():
+        return None
+
+    autorun = parse_autorun_exe(folder)
+    if autorun:
+        return autorun
+
+    def score(p: Path) -> tuple[int, int]:
+        name = p.stem.lower()
+        # чем меньше — тем лучше
+        penalty = 0
+        if any(s in name for s in SKIP_EXE_NAMES):
+            penalty += 100
+        if name in {"setup", "install"}:
+            penalty += 50
+        # предпочитаем корень
+        depth = len(p.relative_to(folder).parts)
+        try:
+            size = -p.stat().st_size  # больший exe чуть предпочтительнее
+        except OSError:
+            size = 0
+        return (penalty, depth, size)
+
+    exes: list[Path] = []
+    try:
+        for p in folder.rglob("*.exe"):
+            if not p.is_file():
+                continue
+            # не уходим слишком глубоко в redistributables
+            rel = p.relative_to(folder).parts
+            if any(part.lower() in {"vcredist_x86", "vcredist_x64", "dotnet20"} for part in rel[:-1]):
+                continue
+            exes.append(p)
+    except OSError:
+        pass
+
+    if not exes:
+        return None
+    exes.sort(key=score)
+    best = exes[0]
+    if score(best)[0] >= 100 and len(exes) == 1:
+        return best
+    if score(best)[0] >= 100:
+        # только инсталляторы — лучше открыть папку
+        return None
+    return best
+
+
+def collect_files(source: Path) -> list[Path]:
+    files: list[Path] = []
+    if source.is_file():
+        return [source]
+    try:
+        for p in source.rglob("*"):
+            if p.is_file():
+                files.append(p)
+    except OSError:
+        pass
+    return files
+
+
+def copy_tree_with_progress(
+    source: Path,
+    dest: Path,
+    on_progress=None,
+) -> None:
+    """
+    Копирует всё содержимое source → dest.
+    on_progress(done, total, current_relpath)
+    """
+    import shutil
+    import zipfile
+
+    if source.is_file() and source.suffix.lower() == ".zip":
+        dest.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(source, "r") as zf:
+            names = zf.namelist()
+            total = max(len(names), 1)
+            for i, name in enumerate(names, 1):
+                zf.extract(name, dest)
+                if on_progress:
+                    on_progress(i, total, name)
+        return
+
+    files = collect_files(source)
+    total = max(len(files), 1)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    is_drive_root = len(source.parts) == 1 or str(source).endswith(":\\")
+    # для корня диска и обычной папки — копируем содержимое внутрь dest
+    for i, src_file in enumerate(files, 1):
+        try:
+            rel = src_file.relative_to(source)
+        except ValueError:
+            rel = Path(src_file.name)
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_file, target)
+        if on_progress:
+            on_progress(i, total, str(rel))
+    # на всякий случай создаём пустые каталоги верхнего уровня
+    if source.is_dir():
+        try:
+            for child in source.iterdir():
+                if child.is_dir():
+                    (dest / child.name).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    _ = is_drive_root  # поведение одинаковое: содержимое → dest
 
 
 def find_patient_source_on_disc(disc_root: Path) -> Optional[tuple[str, Path]]:

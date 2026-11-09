@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import shutil
 import threading
-import zipfile
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from ct_share.common import (
     DetectedScan,
+    copy_tree_with_progress,
     describe_drives,
     detect_scan,
-    extract_identity_from_text,
+    human_fio_to_folder,
     iter_ready_media,
     media_fingerprint,
     shared_root,
@@ -70,7 +70,7 @@ class AdminApp:
 
         btns = ttk.Frame(frame)
         btns.pack(fill="x", pady=(14, 0))
-        ttk.Button(btns, text="Выбрать папку…", command=self._pick_folder).pack(side="left")
+        ttk.Button(btns, text="Выбрать диск…", command=self._pick_folder).pack(side="left")
         ttk.Button(btns, text="Настройки", command=self._settings).pack(side="left", padx=(8, 0))
         self.auto_btn = ttk.Button(btns, text=self._autostart_label(), command=self._toggle_autostart)
         self.auto_btn.pack(side="left", padx=(8, 0))
@@ -92,30 +92,14 @@ class AdminApp:
         self.auto_btn.configure(text=self._autostart_label())
 
     def _pick_folder(self) -> None:
-        chosen = filedialog.askdirectory(parent=self.root, title="Папка или диск с КТ")
+        chosen = filedialog.askdirectory(parent=self.root, title="Диск или папка с КТ")
         if not chosen:
             return
         root = Path(chosen)
         det = detect_scan(root)
-        if not det and root.is_dir():
-            fio_folder, display, birth = extract_identity_from_text(root.name)
-            if fio_folder:
-                det = DetectedScan(
-                    fio_folder=fio_folder,
-                    display_name=display or fio_folder.replace("_", " "),
-                    birth_date=birth,
-                    source=root,
-                )
-            else:
-                det = DetectedScan(
-                    fio_folder=root.name.replace(" ", "_"),
-                    display_name=root.name.replace("_", " "),
-                    birth_date=None,
-                    source=root,
-                )
         if not det:
-            messagebox.showwarning("КТ", "Не удалось распознать снимок в этой папке.", parent=self.root)
-            return
+            # всё равно предложим скопировать весь выбранный путь
+            det = DetectedScan(fio_folder="", display_name="", birth_date=None, source=root)
         self._busy = True
         self._ask_and_copy(det)
 
@@ -157,7 +141,7 @@ class AdminApp:
             self._busy = True
             append_log(
                 "admin",
-                f"detected fio={det.fio_folder} birth={det.birth_date} src={det.source}",
+                f"detected fio={det.fio_folder!r} birth={det.birth_date} src={det.source}",
             )
             self.root.after(0, lambda d=det: self._ask_and_copy(d))
             return
@@ -169,10 +153,55 @@ class AdminApp:
         else:
             self._set_status(f"Готово. {describe_drives()}")
 
+    def _ask_fio(self, suggested: str) -> str | None:
+        """Диалог ввода ФИО для имени папки."""
+        win = tk.Toplevel(self.root)
+        win.title("ФИО пациента")
+        win.geometry("420x160")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+        win.attributes("-topmost", True)
+
+        result: dict[str, str | None] = {"value": None}
+
+        frame = ttk.Frame(win, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text="Введите ФИО пациента — так будет названа папка:",
+            wraplength=380,
+        ).pack(anchor="w")
+
+        var = tk.StringVar(value=suggested)
+        entry = ttk.Entry(frame, textvariable=var, font=("", 12))
+        entry.pack(fill="x", pady=(10, 0))
+        entry.focus_set()
+        entry.selection_range(0, tk.END)
+
+        def ok() -> None:
+            text = var.get().strip()
+            if not text:
+                messagebox.showwarning("ФИО", "Введите ФИО пациента.", parent=win)
+                return
+            result["value"] = text
+            win.destroy()
+
+        def cancel() -> None:
+            result["value"] = None
+            win.destroy()
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x", pady=(16, 0))
+        ttk.Button(btns, text="OK", command=ok).pack(side="right")
+        ttk.Button(btns, text="Отмена", command=cancel).pack(side="right", padx=(0, 8))
+        win.bind("<Return>", lambda _e: ok())
+        win.bind("<Escape>", lambda _e: cancel())
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        self.root.wait_window(win)
+        return result["value"]
+
     def _ask_and_copy(self, det: DetectedScan) -> None:
-        label = det.display_name
-        if det.birth_date:
-            label += f"\nДата рождения: {det.birth_date}"
         try:
             share = shared_root()
         except OSError as exc:
@@ -180,14 +209,19 @@ class AdminApp:
             self._busy = False
             return
 
-        dest = share / det.fio_folder
         self.root.lift()
         self.root.attributes("-topmost", True)
+
+        hint = det.display_name or "не удалось определить автоматически"
+        if det.birth_date:
+            hint += f"\nДата рождения (из снимка): {det.birth_date}"
+
         answer = messagebox.askyesno(
             "Поделиться КТ?",
-            f"Найден снимок:\n\n{label}\n\n"
-            f"Будет создана папка:\n{det.fio_folder}\n\n"
-            f"в\n{share}",
+            f"Найден диск с КТ.\n\n"
+            f"ФИО (авто): {hint}\n\n"
+            f"Будет скопировано ВСЁ содержимое диска\n{det.source}\n\n"
+            f"в общую папку:\n{share}",
             parent=self.root,
             icon=messagebox.QUESTION,
         )
@@ -195,6 +229,15 @@ class AdminApp:
             self._busy = False
             self._set_status("Отменено")
             return
+
+        fio_input = self._ask_fio(det.display_name or "")
+        if not fio_input:
+            self._busy = False
+            self._set_status("Отменено")
+            return
+
+        fio_folder = human_fio_to_folder(fio_input)
+        dest = share / fio_folder
 
         if dest.exists():
             overwrite = messagebox.askyesno(
@@ -215,19 +258,36 @@ class AdminApp:
 
         progress = tk.Toplevel(self.root)
         progress.title("Копирование")
-        progress.geometry("320x90")
+        progress.geometry("440x140")
         progress.resizable(False, False)
         progress.transient(self.root)
         progress.grab_set()
-        ttk.Label(progress, text="Копирование КТ…", padding=16).pack()
-        bar = ttk.Progressbar(progress, mode="indeterminate", length=260)
-        bar.pack(padx=16, pady=(0, 16))
-        bar.start(12)
+        progress.attributes("-topmost", True)
+
+        ttk.Label(progress, text=f"Копирование → {fio_folder}", padding=(16, 12, 16, 4)).pack(anchor="w")
+        file_lbl = ttk.Label(progress, text="Подсчёт файлов…", foreground="#555", wraplength=400)
+        file_lbl.pack(anchor="w", padx=16)
+        bar = ttk.Progressbar(progress, mode="determinate", length=400, maximum=100)
+        bar.pack(padx=16, pady=(8, 4))
+        pct_lbl = ttk.Label(progress, text="0%")
+        pct_lbl.pack(anchor="e", padx=16, pady=(0, 12))
+
+        def on_progress(done: int, total: int, rel: str) -> None:
+            pct = int(done * 100 / max(total, 1))
+
+            def ui() -> None:
+                bar["maximum"] = total
+                bar["value"] = done
+                short = rel if len(rel) < 60 else "…" + rel[-57:]
+                file_lbl.configure(text=f"{done} / {total}: {short}")
+                pct_lbl.configure(text=f"{pct}%")
+
+            self.root.after(0, ui)
 
         def worker() -> None:
             err: Exception | None = None
             try:
-                _copy_scan(det.source, dest)
+                copy_tree_with_progress(det.source, dest, on_progress=on_progress)
             except Exception as exc:  # noqa: BLE001
                 err = exc
 
@@ -239,9 +299,9 @@ class AdminApp:
                     messagebox.showerror("Ошибка копирования", str(err), parent=self.root)
                     self._set_status("Ошибка копирования")
                 else:
-                    append_log("admin", f"copied: {dest}")
+                    append_log("admin", f"copied all → {dest}")
                     messagebox.showinfo("Готово", f"КТ скопирован:\n{dest}", parent=self.root)
-                    self._set_status(f"Скопировано: {det.fio_folder}")
+                    self._set_status(f"Скопировано: {fio_folder}")
 
             self.root.after(0, done)
 
@@ -251,27 +311,6 @@ class AdminApp:
         if not getattr(self, "_ready", False):
             return
         self.root.mainloop()
-
-
-def _copy_scan(source: Path, dest: Path) -> None:
-    if source.is_file() and source.suffix.lower() == ".zip":
-        dest.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(source, "r") as zf:
-            zf.extractall(dest)
-        return
-
-    is_drive_root = len(source.parts) == 1 or str(source).endswith(":\\")
-    if is_drive_root:
-        dest.mkdir(parents=True, exist_ok=True)
-        for child in source.iterdir():
-            target = dest / child.name
-            if child.is_dir():
-                shutil.copytree(child, target)
-            else:
-                shutil.copy2(child, target)
-        return
-
-    shutil.copytree(source, dest)
 
 
 def run_gui() -> None:
