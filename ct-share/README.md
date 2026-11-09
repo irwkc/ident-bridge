@@ -9,7 +9,7 @@
 | Админ (дисковод) | [CTShareAdmin.exe](https://github.com/irwkc/ident-bridge/raw/main/ct-share/release/CTShareAdmin.exe) |
 | Врач (кабинеты) | [CTShareDoctor.exe](https://github.com/irwkc/ident-bridge/raw/main/ct-share/release/CTShareDoctor.exe) |
 
-Также: [Releases](https://github.com/irwkc/ident-bridge/releases) · [Actions → Build CT Share EXE](https://github.com/irwkc/ident-bridge/actions/workflows/build-ct-share.yml)
+[Релизы](https://github.com/irwkc/ident-bridge/releases) · [Actions](https://github.com/irwkc/ident-bridge/actions/workflows/build-ct-share.yml)
 
 ## Установка
 

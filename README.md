@@ -1,7 +1,5 @@
 # Клиника — локальные приложения
 
-Два Windows-продукта (скачать EXE и запустить):
-
 ## CT Share — обмен КТ
 
 | Приложение | Скачать |
@@ -21,4 +19,4 @@
 
 ---
 
-Релизы и артефакты CI: [Releases](https://github.com/irwkc/ident-bridge/releases) · [Actions](https://github.com/irwkc/ident-bridge/actions)
+[Релизы](https://github.com/irwkc/ident-bridge/releases) · [Actions](https://github.com/irwkc/ident-bridge/actions)
