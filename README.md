@@ -12,8 +12,14 @@ Windows-приложение для моста **IDENT ↔ Yeastar S20**.
 
 ## Скачать EXE
 
-1. Открой вкладку **Actions** → workflow **Build Windows EXE** → последний успешный run → **Artifacts** → `IdentBridge-windows`
-2. Или **Releases** — там же лежит `IdentBridge.exe`
+Прямая ссылка из репозитория (самый простой способ):
+
+- [`release/IdentBridge.exe`](./release/IdentBridge.exe)
+
+Также:
+
+1. **Releases** — `IdentBridge.exe` у каждого билда
+2. **Actions** → **Build Windows EXE** → Artifacts → `IdentBridge-windows`
 
 ## Установка на ПК клиники
 
@@ -21,7 +27,11 @@ Windows-приложение для моста **IDENT ↔ Yeastar S20**.
 2. Запусти (Windows спросит права при установке автозапуска)
 3. Нажми **Install autostart** → **Да** в UAC
 4. Открой **Edit .env** и заполни ключи (как в старом `.env`)
-5. **Restart**
+5. Для прослушивания записей в Ident проверь:
+   - `RECORDINGS_ROOT` — UNC к `...\mmc1\autorecords` на Yeastar  
+   - `RECORD_PUBLIC_BASE_URL` — `http://<IP этого ПК>:8000`  
+   (можно оставить пустыми: подставятся автоматом)
+6. **Restart** → **Install autostart** от имени пользователя, у которого есть доступ к шаре Yeastar (не SYSTEM)
 
 Готово: bridge работает в фоне, окно можно закрыть.
 

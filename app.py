@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pymysql
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pymysql.cursors import DictCursor
 
@@ -77,8 +77,16 @@ CLINIC_PHONE = normalize_phone(os.getenv("CLINIC_PHONE", "").strip()) if os.gete
 TRUNK_LINE_MAP_RAW = os.getenv("TRUNK_LINE_MAP", "").strip()
 
 RECORDINGS_ROOT_RAW = os.getenv("RECORDINGS_ROOT", "").strip()
+# Типичный путь Yeastar S-серии, если в .env забыли RECORDINGS_ROOT
+if not RECORDINGS_ROOT_RAW and YEASTAR_HOST:
+    RECORDINGS_ROOT_RAW = rf"\\{YEASTAR_HOST}\share\mmc1\autorecords"
 RECORDINGS_ROOT = Path(RECORDINGS_ROOT_RAW) if RECORDINGS_ROOT_RAW else None
 RECORD_PUBLIC_BASE_URL = os.getenv("RECORD_PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+print(
+    f"[config] recordings_root={RECORDINGS_ROOT_RAW or '(empty)'} "
+    f"public_base={RECORD_PUBLIC_BASE_URL or '(auto from request Host)'}"
+)
 
 
 def parse_trunk_line_map(raw: str) -> Dict[str, str]:
@@ -149,13 +157,26 @@ def normalize_record_relpath(recordpath: Optional[str]) -> Optional[str]:
     return rp
 
 
-def build_record_url(recordpath: Optional[str]) -> Optional[str]:
+def resolve_record_public_base(request: Optional[Request] = None) -> Optional[str]:
+    """Публичный URL моста: из .env или из Host, которым Ident уже стучится."""
+    if RECORD_PUBLIC_BASE_URL:
+        return RECORD_PUBLIC_BASE_URL
+    if request is not None:
+        return str(request.base_url).rstrip("/")
+    return None
+
+
+def build_record_url(
+    recordpath: Optional[str],
+    public_base: Optional[str] = None,
+) -> Optional[str]:
     rel = normalize_record_relpath(recordpath)
-    if not rel or not RECORD_PUBLIC_BASE_URL:
+    base = (public_base or RECORD_PUBLIC_BASE_URL or "").rstrip("/")
+    if not rel or not base:
         return None
 
     rel = rel.replace("\\", "/").lstrip("/")
-    return f"{RECORD_PUBLIC_BASE_URL}/records/{quote(rel, safe='/')}"
+    return f"{base}/records/{quote(rel, safe='/')}"
 
 
 def map_trunk_to_phone(trunk_name: Optional[str]) -> Optional[str]:
@@ -277,7 +298,10 @@ def choose_outbound_clinic_number(row: Dict, src_number: Optional[str]) -> Optio
     return dod_number or dstrunk_phone or CLINIC_PHONE or src_number
 
 
-def cdr_row_to_ident(row: Dict) -> Optional[Dict]:
+def cdr_row_to_ident(
+    row: Dict,
+    public_base: Optional[str] = None,
+) -> Optional[Dict]:
     calltype = (row.get("calltype") or "").strip().lower()
 
     src_number = normalize_phone(row.get("src"))
@@ -318,7 +342,7 @@ def cdr_row_to_ident(row: Dict) -> Optional[Dict]:
         "WaitInSeconds": wait_seconds,
         "TalkInSeconds": talk_seconds,
         "LineDescription": line_description,
-        "RecordUrl": build_record_url(row.get("recordpath")),
+        "RecordUrl": build_record_url(row.get("recordpath"), public_base=public_base),
     }
 
 
@@ -655,6 +679,14 @@ def status_rows_to_ongoing(rows: List[Dict]) -> List[Dict]:
     return result
 
 
+def _recording_media_type(path: Path) -> str:
+    return {
+        ".wav": "audio/wav",
+        ".mp3": "audio/mpeg",
+        ".gsm": "audio/x-gsm",
+    }.get(path.suffix.lower(), "application/octet-stream")
+
+
 @app.get("/records/{record_rel_path:path}")
 def get_record(record_rel_path: str):
     if not RECORDINGS_ROOT:
@@ -668,7 +700,8 @@ def get_record(record_rel_path: str):
         file_name = rel_path.name
         try:
             matches = list(RECORDINGS_ROOT.rglob(file_name))
-        except Exception:
+        except Exception as exc:
+            print(f"[records] rglob failed under {RECORDINGS_ROOT}: {exc!r}")
             matches = []
 
         if matches:
@@ -679,17 +712,29 @@ def get_record(record_rel_path: str):
     return FileResponse(
         path=str(file_path),
         filename=file_path.name,
-        media_type="application/octet-stream",
+        media_type=_recording_media_type(file_path),
     )
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    reachable: Optional[bool] = None
+    if RECORDINGS_ROOT:
+        try:
+            reachable = RECORDINGS_ROOT.exists()
+        except Exception:
+            reachable = False
+    return {
+        "status": "ok",
+        "recordingsConfigured": bool(RECORDINGS_ROOT),
+        "recordingsReachable": reachable,
+        "recordPublicBase": RECORD_PUBLIC_BASE_URL or None,
+    }
 
 
 @app.get("/GetFinishedCalls")
 def get_finished_calls(
+    request: Request,
     dateTimeFrom: str = Query(...),
     dateTimeTo: str = Query(...),
     limit: int = Query(500, ge=1, le=5000),
@@ -700,6 +745,7 @@ def get_finished_calls(
 
     dt_from = parse_ident_dt(dateTimeFrom).replace(tzinfo=None)
     dt_to = parse_ident_dt(dateTimeTo).replace(tzinfo=None)
+    public_base = resolve_record_public_base(request)
 
     db_name, tables = discover_cdr_db_and_tables()
     if not tables:
@@ -719,10 +765,18 @@ def get_finished_calls(
         cur.close()
 
         result = []
+        with_url = 0
         for row in rows:
-            item = cdr_row_to_ident(row)
+            item = cdr_row_to_ident(row, public_base=public_base)
             if item:
+                if item.get("RecordUrl"):
+                    with_url += 1
                 result.append(item)
+        if result and with_url == 0:
+            print(
+                f"[GetFinishedCalls] {len(result)} calls but 0 RecordUrl "
+                f"(public_base={public_base!r}, recordings_root={RECORDINGS_ROOT_RAW!r})"
+            )
         return result
     finally:
         conn.close()

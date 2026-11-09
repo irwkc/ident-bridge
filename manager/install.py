@@ -25,6 +25,9 @@ SERVICE_TIMEZONE=Europe/Moscow
 INTERNAL_EXTENSIONS_REGEX=^\\d{3,4}$
 TRUNK_LINE_MAP=
 CLINIC_PHONE=
+# Записи звонков для Ident (пример):
+# RECORDINGS_ROOT=\\\\172.16.0.10\\share\\mmc1\\autorecords
+# RECORD_PUBLIC_BASE_URL=http://172.16.0.14:8000
 RECORDINGS_ROOT=
 RECORD_PUBLIC_BASE_URL=
 """
@@ -82,6 +85,39 @@ def elevate_and_rerun(extra_args: list[str] | None = None) -> None:
         )
 
 
+def _env_has_key(text: str, key: str) -> bool:
+    prefix = f"{key}="
+    return any(line.strip().startswith(prefix) for line in text.splitlines())
+
+
+def ensure_recording_env_keys(env: Path) -> None:
+    """Дописывает RECORD_* в .env, если их случайно снесли при установке."""
+    try:
+        text = env.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+
+    additions: list[str] = []
+    if not _env_has_key(text, "RECORDINGS_ROOT"):
+        # Пусто → app.py возьмёт \\{YEASTAR_HOST}\share\mmc1\autorecords
+        additions.append("RECORDINGS_ROOT=")
+    if not _env_has_key(text, "RECORD_PUBLIC_BASE_URL"):
+        # Пусто → URL берётся из Host-запроса Ident
+        additions.append("RECORD_PUBLIC_BASE_URL=")
+
+    if not additions:
+        return
+
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += "\n# Call recordings for Ident (leave empty for auto defaults)\n"
+    text += "\n".join(additions) + "\n"
+    try:
+        env.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def ensure_install_layout() -> Path:
     root = install_dir()
     root.mkdir(parents=True, exist_ok=True)
@@ -94,6 +130,7 @@ def ensure_install_layout() -> Path:
             shutil.copy2(example, env)
         else:
             env.write_text(ENV_TEMPLATE, encoding="utf-8")
+    ensure_recording_env_keys(env)
 
     src_app = project_root() / "app.py"
     dst_app = root / "app.py"
@@ -138,7 +175,11 @@ def autostart_installed() -> bool:
 
 
 def _register_task_powershell(exe: str, args: str) -> tuple[bool, str]:
-    """Register task with WorkingDirectory via PowerShell (more reliable than schtasks)."""
+    """Register task with WorkingDirectory via PowerShell (more reliable than schtasks).
+
+    Runs as the installing user (not SYSTEM): SYSTEM usually cannot read the
+    Yeastar SMB share (RECORDINGS_ROOT), so Ident loses call playback.
+    """
     # Escape for PowerShell single-quoted strings
     def q(s: str) -> str:
         return s.replace("'", "''")
@@ -147,10 +188,12 @@ def _register_task_powershell(exe: str, args: str) -> tuple[bool, str]:
     ps = f"""
 $ErrorActionPreference = 'Stop'
 $TaskName = '{TASK_NAME}'
+$userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
 $action = New-ScheduledTaskAction -Execute '{q(exe)}' -Argument '{q(args)}' -WorkingDirectory '{q(root)}'
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+# At logon so the user token can access \\\\YEASTAR\\share\\... recordings
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+$principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 3650) -MultipleInstances IgnoreNew -Hidden
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
