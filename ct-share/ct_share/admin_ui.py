@@ -8,11 +8,12 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from ct_share.common import (
+    DetectedScan,
     describe_drives,
-    find_patient_source_on_disc,
+    detect_scan,
+    extract_identity_from_text,
     iter_ready_media,
     media_fingerprint,
-    parse_patient_folder,
     shared_root,
 )
 from ct_share.install import (
@@ -95,17 +96,28 @@ class AdminApp:
         if not chosen:
             return
         root = Path(chosen)
-        found = find_patient_source_on_disc(root)
-        if not found:
-            # Если выбрали саму папку пациента
-            if root.is_dir():
-                found = (root.name, root)
+        det = detect_scan(root)
+        if not det and root.is_dir():
+            fio_folder, display, birth = extract_identity_from_text(root.name)
+            if fio_folder:
+                det = DetectedScan(
+                    fio_folder=fio_folder,
+                    display_name=display or fio_folder.replace("_", " "),
+                    birth_date=birth,
+                    source=root,
+                )
             else:
-                messagebox.showwarning("КТ", "Не удалось распознать снимок в этой папке.", parent=self.root)
-                return
-        folder_name, source = found
+                det = DetectedScan(
+                    fio_folder=root.name.replace(" ", "_"),
+                    display_name=root.name.replace("_", " "),
+                    birth_date=None,
+                    source=root,
+                )
+        if not det:
+            messagebox.showwarning("КТ", "Не удалось распознать снимок в этой папке.", parent=self.root)
+            return
         self._busy = True
-        self._ask_and_copy(folder_name, source)
+        self._ask_and_copy(det)
 
     def _on_close(self) -> None:
         self._stop.set()
@@ -136,20 +148,20 @@ class AdminApp:
             if fp in self._handled:
                 continue
 
-            found = find_patient_source_on_disc(root)
-            if not found:
-                # Не КТ — не помечаем навсегда: при смене содержимого спросим снова
+            det = detect_scan(root)
+            if not det:
                 self._set_status(f"{root} — нет КТ. {describe_drives()}")
                 continue
 
-            folder_name, source = found
             self._handled.add(fp)
             self._busy = True
-            append_log("admin", f"detected {folder_name} on {root}")
-            self.root.after(0, lambda fn=folder_name, src=source: self._ask_and_copy(fn, src))
+            append_log(
+                "admin",
+                f"detected fio={det.fio_folder} birth={det.birth_date} src={det.source}",
+            )
+            self.root.after(0, lambda d=det: self._ask_and_copy(d))
             return
 
-        # Носитель извлечён — снова спросим при следующей вставке
         self._handled &= ready_fps
 
         if not ready_fps:
@@ -157,9 +169,10 @@ class AdminApp:
         else:
             self._set_status(f"Готово. {describe_drives()}")
 
-    def _ask_and_copy(self, folder_name: str, source: Path) -> None:
-        fio, birth = parse_patient_folder(folder_name)
-        label = f"{fio}" + (f"\nДата рождения: {birth}" if birth else "")
+    def _ask_and_copy(self, det: DetectedScan) -> None:
+        label = det.display_name
+        if det.birth_date:
+            label += f"\nДата рождения: {det.birth_date}"
         try:
             share = shared_root()
         except OSError as exc:
@@ -167,13 +180,14 @@ class AdminApp:
             self._busy = False
             return
 
-        dest = share / folder_name
+        dest = share / det.fio_folder
         self.root.lift()
         self.root.attributes("-topmost", True)
         answer = messagebox.askyesno(
             "Поделиться КТ?",
-            f"Найден снимок:\n\n{label}\n\nПапка:\n{folder_name}\n\n"
-            f"Скопировать в общую сетевую папку?\n{share}",
+            f"Найден снимок:\n\n{label}\n\n"
+            f"Будет создана папка:\n{det.fio_folder}\n\n"
+            f"в\n{share}",
             parent=self.root,
             icon=messagebox.QUESTION,
         )
@@ -213,7 +227,7 @@ class AdminApp:
         def worker() -> None:
             err: Exception | None = None
             try:
-                _copy_scan(source, dest)
+                _copy_scan(det.source, dest)
             except Exception as exc:  # noqa: BLE001
                 err = exc
 
@@ -227,7 +241,7 @@ class AdminApp:
                 else:
                     append_log("admin", f"copied: {dest}")
                     messagebox.showinfo("Готово", f"КТ скопирован:\n{dest}", parent=self.root)
-                    self._set_status(f"Скопировано: {folder_name}")
+                    self._set_status(f"Скопировано: {det.fio_folder}")
 
             self.root.after(0, done)
 
